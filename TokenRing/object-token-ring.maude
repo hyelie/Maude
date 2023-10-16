@@ -1,0 +1,65 @@
+--- module in textbook
+mod MESSAGE-CONTENT is
+    sort MsgContent . --- message content, application-specific
+endm
+
+omod MESSAGE-WRAPPER is
+    including MESSAGE-CONTENT .
+    op msg_from_to_ : MsgContent Oid Oid -> Msg [ctor] .
+endom
+---
+
+omod OBJECT-TOKEN-RING is
+    including MESSAGE-WRAPPER . --- object들 간의 message 처리
+
+    class Node | state : MutexState, next : Oid . --- 각 Node : state와 next를 가짐.
+
+    sort MutexState .
+    ops normal waiting acquire : -> MutexState [ctor] . --- state 정의
+
+    --- prev, current, next
+    vars P C N : Oid .
+
+    op token : -> MsgContent [ctor] .
+
+    --- current node가 normal이면 waiting으로 변경
+    rl [AccessRequest] :
+            < C : Node | state : normal >
+        =>  < C : Node | state : waiting > .
+
+    --- message를 받았을 때 current node가 normal이면 다른 state로 바뀌지 않고, next node에게 전달
+    rl [SkipToken] :
+            (msg token from P to C)     < C : Node | state : normal, next : N >   
+        =>  (msg token from C to N)     < N : Node | > .
+
+    --- message를 받았을 때 current node가 waiting이면 acquire로 변경 (critical section에 진입)
+    rl [Access] :
+            (msg token from P to C)     < C : Node | state : waiting >   
+        =>                              < C : Node | state : acquire > .
+
+    --- critical section에서 나감
+    --- current node state가 acquire에서 normal로 변경, next node로 message 전달
+    rl [Release] :
+            < C : Node | state : acquire, next : N >
+        =>  < C : Node | state : normal >    (msg token from C to N) .
+endom
+
+omod OBJECT-TOKEN-INIT is
+    including OBJECT-TOKEN-RING .
+
+    ops a b c d : -> Oid [ctor] .
+    op init : -> Configuration .
+    
+    eq init = (msg token from d to a) --- token이 전달된 상황
+    < a : Node | state : normal, next : b >
+    < b : Node | state : normal, next : c >
+    < c : Node | state : normal, next : d >
+    < d : Node | state : normal, next : a > .
+endom
+
+***(
+    set trace on .
+    search [1] init =>* C:Configuration < C:Oid : Node | state : acquire > < N:Oid : Node | state : acquire > .
+
+    search [1] init =>* C:Configuration < C:Oid : Node | state : normal > < N:Oid : Node | state : normal > .
+)
