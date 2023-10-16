@@ -58,8 +58,6 @@ omod OBJECT-TOKEN-INIT is
 endom
 
 ***(
+    load ./object-token-ring.maude
     set trace on .
-    search [1] init =>* C:Configuration < C:Oid : Node | state : acquire > < N:Oid : Node | state : acquire > .
-
-    search [1] init =>* C:Configuration < C:Oid : Node | state : normal > < N:Oid : Node | state : normal > .
 )
