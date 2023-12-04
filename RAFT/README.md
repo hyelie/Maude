@@ -457,7 +457,7 @@ C:Configuration -->
 ```
 마찬가지로 log matching, leader safety, state machine safety를 검증할 수 있습니다.
 
-#### test6Node : node가 6개일 때 (상태 폭발 추정)
+#### test6Node
 test6Node는 node가 6개일 때 검증하는 모듈입니다. 실행은 약 20분 정도가 걸립니다.
 ```
 search [1] test6Node =>! C:Configuration .
