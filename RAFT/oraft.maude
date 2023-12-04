@@ -1,0 +1,599 @@
+--- 기존 raft에서 omod로 변경
+--- rl에서 필요 없는 attribute들 삭제
+--- 변수 네이밍 convention 따라 대문자로 시작하게 변경
+--- search문 수정
+
+--- 이후 confluent하게 수정
+
+--- module 이름 : 전체 대문자
+--- sort : camel case
+--- module operator : 전체 소문자
+--- 이외
+fmod ENTRY is
+  pr STRING .
+
+  sort Entry .
+  op entry : Nat Nat Command -> Entry [ctor] .
+
+  sort Command .
+  subsort String < Command .
+
+  --- getter
+  vars Index TermNumber : Nat .
+  var Command : Command .
+
+  op getTermNumber : Entry -> Nat .
+  eq getTermNumber(entry(Index, TermNumber, Command)) = TermNumber .
+
+  op getIndex : Entry -> Nat .
+  eq getIndex(entry(Index, TermNumber, Command)) = Index .
+
+  op getCommand : Entry -> Command .
+  eq getCommand(entry(Index, TermNumber, Command)) = Command .
+
+  --- compare
+  vars Entry1 Entry2 : Entry .
+  op _<_ : Entry Entry -> Bool .
+  eq Entry1 < Entry2 = getTermNumber(Entry1) < getTermNumber(Entry2) or (getTermNumber(Entry1) == getTermNumber(Entry2) and getIndex(Entry1) <= getIndex(Entry2)) .
+endfm
+
+fmod LOG is
+  pr ENTRY .
+
+  sort Log .
+  subsort Entry < Log .
+
+  --- default operation
+  op emptyLog : -> Log [ctor] .
+  op _++_ : Log Log -> Log [ctor assoc id: emptyLog] .
+
+  var Arr1 Arr2 : Log .
+  var E : Entry .
+
+  --- check Log contains entry
+  op contains : Log Entry -> Bool .
+  eq contains(Arr1 ++ E ++ Arr2, E) = true .
+  eq contains(Arr1, E) = false . --- owise
+  --- 임의의 순서로 실행될 수 있어서 owise가 추가되어야 한다.  TODO confluent (어떤 순서로 실행해도 결과 동일)
+
+  --- get top of Log
+  op head : Log -> Entry .
+  eq head(Arr1 ++ E) = E .
+endfm
+
+mod MESSAGE is
+  ex CONFIGURATION .
+  pr LOG .
+
+  sort MessageContent .
+
+  --- request from client
+  op clientRequest : Command -> MessageContent [ctor] .
+
+  --- append log entry
+  op requestAppendEntry : Nat Log -> MessageContent [ctor] .
+
+  --- follower가 log를 갱신한 경우 true, 아닌 경우 false (offline 등)
+  op responseAppendEntry : Nat Bool -> MessageContent [ctor] .
+
+  --- leader가 follower에게 commit하라고 요청 (만약 entry가 없다면 아무것도 하지 않음)
+  op requestCommit : Nat Entry -> MessageContent [ctor] .
+
+  --- candidate의 term과 entry를 주면서 투표 요청
+  op requestVote : Nat Entry -> MessageContent [ctor] .
+
+  --- 제일 최신 log가 다른 term을 가지는 경우, 더 큰 term이 더 최신 버전의 것이다. term이 같다면 index가 커야 한다.
+  --- candidate가 최신이고 && online인 경우 true, 그렇지 않은 경우 false
+  op responseVote : Nat Bool -> MessageContent [ctor] .
+
+  op msg_from_to_ : MessageContent Oid Oid -> Msg [ctor] .
+
+  var Content : MessageContent .
+  vars Src Dest : Oid .
+
+  op getDest : Msg -> Oid .
+  eq getDest(msg Content from Src to Dest) = Dest .
+
+  op getContent : Msg -> MessageContent .
+  eq getContent(msg Content from Src to Dest) = Content .
+endm
+
+mod MULTICAST is
+  pr MESSAGE .
+
+  sort OidSet .
+  subsort Oid < OidSet .
+
+  --- empty set 정의
+  op none : -> OidSet [ctor] .
+
+  --- set 합치기
+  op _,_ : OidSet OidSet -> OidSet [ctor assoc comm id: none] .
+
+  --- multicast
+  var Message : MessageContent .
+  vars Sender Receiver : Oid .
+  var OtherReceivers : OidSet .
+
+  op multicast_from_to_ : MessageContent Oid OidSet -> Msg [ctor] .
+  eq multicast Message from Sender to none = none . --- 종료조건
+  eq multicast Message from Sender to (Receiver, OtherReceivers) = (msg Message from Sender to Receiver) multicast Message from Sender to OtherReceivers .
+endm
+
+
+omod ONODE is 
+  pr MULTICAST .
+
+  class ONode | type : NodeType, nodeTerm : Nat, log : Log, committedLog : Log,
+                neighbors : OidSet, isWaiting : Bool,
+                quorum : Nat, numNeighbors : Nat, numPros : Nat,
+                numResponses : Nat .
+  --- type : node type
+  --- nodeTerm : node가 가지고 있는 term
+  --- log : node가 가지고 있는 log
+  --- committedLog : log가 가지고 있는 커밋된 log
+  --- isWaiting : 대기 여부, leader에서만 사용됨
+  --- quorum : cluster의 정족수
+  --- numNeighbors : cluster의 node 개수
+  --- numPros : election이나 commit에서 사용할 찬성 응답 개수
+  --- numResponses : election이사 commit에서 응답 개수
+
+  sort NodeType .
+  ops FollowerNode LeaderNode OfflineNode CandidateNode : -> NodeType [ctor] .
+
+  --- node constructor
+  op onode : Nat -> Oid [ctor] .
+
+  --- transition을 위한 변수들
+  var command : Command .
+  vars Client Leader Follower Candidate CurrentNode NextNode : Oid .
+  var Followers : OidSet .
+  vars CurrentLog NextLog CommittedLog : Log .
+  var CommitEntry CurrentEntry LeaderEntry FollowerEntry VoteEntry : Entry .
+  vars CurrentTerm NextTerm NumPros NumResponses NumNeighbors : Nat .
+  vars Quorum : Nat .
+  var AS : AttributeSet .
+  var BoolValue : Bool .
+  var message : Msg .
+
+  --- utility
+  op boolToNumber : Bool -> Nat .
+  eq boolToNumber(false) = 0 .
+  eq boolToNumber(true) = 1 .
+
+
+
+  ------ client로부터 새로운 요청이 들어온 경우
+  --- 1. leader는 해당 요청을 follower에게 전파한다.
+  crl [client-request-to-leader] :
+    (msg clientRequest(command) from Client to Leader)
+    < Leader : ONode | type : LeaderNode, nodeTerm : CurrentTerm, log : CurrentLog, neighbors : Followers, isWaiting : false, numPros : NumPros, numResponses : NumResponses >
+    =>
+    < Leader : ONode | log : NextLog, isWaiting : true , numPros : 1 , numResponses : 0 >
+    (multicast requestAppendEntry(CurrentTerm, NextLog) from Leader to Followers)
+    if NextLog := CurrentLog ++ entry(getIndex(head(CurrentLog)) + 1, CurrentTerm, command) .
+
+  --- 2. follower가 가지고 있는 term보다 더 큰 것을 받은 경우 true를 응답한다.
+  crl [followers-response-append-entry] :
+    (msg requestAppendEntry(NextTerm, NextLog) from Leader to Follower)
+    < Follower : ONode | type : FollowerNode, nodeTerm : CurrentTerm, log : CurrentLog >
+    =>
+    < Follower : ONode | nodeTerm : NextTerm, log : NextLog >
+    (msg responseAppendEntry(NextTerm, true) from Follower to Leader)
+    if NextTerm >= CurrentTerm .
+
+  --- 3. leader가 follower로부터 appendEntryResponse를 받은 경우 수치를 갱신한다.
+  rl [leader-got-response-from-follower] :
+    (msg responseAppendEntry(CurrentTerm, BoolValue) from Follower to Leader)
+    < Leader : ONode | type : LeaderNode, nodeTerm : CurrentTerm, log : CurrentLog, numPros : NumPros, numResponses : NumResponses >
+    =>
+    < Leader : ONode | numPros : NumPros + boolToNumber(BoolValue), numResponses : NumResponses + 1 > .
+
+
+
+  ------ commit
+  --- 0. 만약 충분한 수의 응답이 들어오지 않았다면 appendEntryRequest를 재전송한다.
+  crl [leader-retry-append-entry-request] :
+    < Leader : ONode | type : LeaderNode, nodeTerm : CurrentTerm, neighbors : Followers, log : CurrentLog, quorum : Quorum, numPros : NumPros, numNeighbors : NumNeighbors, numResponses : NumNeighbors >
+    =>
+    < Leader : ONode | numPros : 1, numResponses : 0  >
+    (multicast requestAppendEntry(CurrentTerm, CurrentLog) from Leader to Followers)
+    if NumPros < Quorum .
+
+  --- 1. 만약 충분한 수의 응답이 들어왔다면 leader는 commit하고 Followers에게 commit 메시지를 전송한다.
+  crl [leader-request-commit-to-followers] :
+    < Leader : ONode | type : LeaderNode, nodeTerm : CurrentTerm, isWaiting : true , neighbors : Followers, log : CurrentLog, committedLog : CommittedLog, quorum : Quorum, numPros : NumPros, numNeighbors : NumNeighbors, numResponses : NumNeighbors >
+    =>
+    < Leader : ONode |  isWaiting : false, committedLog : CurrentLog >
+    (multicast requestCommit(CurrentTerm, head(CurrentLog)) from Leader to Followers)
+    if NumPros >= Quorum .
+
+  --- 2. follower가 commit 요청을 받는다.
+  --- 2-1. commit할 수 없는 상황이라면 무시한다. (CommitEntry가 이미 commit되었거나, log에 CommitEntry가 없는 경우)
+  crl [follower-ignore-commit-request] :
+    (msg requestCommit(NextTerm, CommitEntry) from Leader to Follower)
+    < Follower : ONode | type : FollowerNode, nodeTerm : CurrentTerm, log : CurrentLog, committedLog : CommittedLog >
+    =>
+    < Follower : ONode | nodeTerm : NextTerm >
+    if (NextTerm >= CurrentTerm) and ((not contains(CurrentLog, CommitEntry)) or (contains(CommittedLog, CommitEntry))) .
+
+  --- 2-2. 그렇지 않다면 받아들인다.
+  crl [follower-apply-commit-request] :
+    (msg requestCommit(NextTerm, CommitEntry) from Leader to Follower)
+    < Follower : ONode | type : FollowerNode, nodeTerm : CurrentTerm, log : CommittedLog ++ CurrentLog ++ CommitEntry ++ NextLog, committedLog : CommittedLog >
+    =>
+    < Follower : ONode | nodeTerm : NextTerm, committedLog : CommittedLog ++ CurrentLog ++ CommitEntry >
+    if NextTerm >= CurrentTerm .
+
+
+
+  ------ leader election
+  --- 1. follower에서 timeout이 발생하는 경우 candidate로 바꾸고, 다른 모든 follower들에게 voteRequest를 전송한다.
+  rl [follower-become-candidate] :
+    < Follower : ONode | type : FollowerNode, nodeTerm : CurrentTerm, log : CurrentLog ++ VoteEntry, neighbors : Followers, numPros : NumPros, numResponses : NumResponses >
+    =>
+    < Follower : ONode | type : CandidateNode, nodeTerm : CurrentTerm + 1, numPros : 1 , numResponses : 0  >
+    (multicast requestVote(CurrentTerm + 1, VoteEntry) from Follower to Followers) .
+
+  --- 2. follower가 voteRequest를 받는다.
+  --- 2-1. 자신이 가지고 있는 entry보다 더 큰 경우에만 true로 응답한다.
+  crl [follower-response-vote] :
+    (msg requestVote(NextTerm, LeaderEntry) from Leader to Follower)
+    < Follower : ONode | type : FollowerNode, nodeTerm : CurrentTerm, log : CurrentLog ++ FollowerEntry >
+    =>
+    < Follower : ONode | nodeTerm : NextTerm >
+    (msg responseVote(NextTerm, (FollowerEntry < LeaderEntry)) from Follower to Leader)
+    if (NextTerm >= CurrentTerm) .
+
+  --- 3. candidate가 follower로부터 voteResponse를 받은 경우 수치를 갱신한다.
+  rl [candidate-got-vote-from-follower] :
+    (msg responseVote(CurrentTerm, BoolValue) from Follower to Candidate)
+    < Candidate : ONode | type : CandidateNode, nodeTerm : CurrentTerm, numPros : NumPros, numResponses : NumResponses >
+    =>
+    < Candidate : ONode | numPros : NumPros + boolToNumber(BoolValue), numResponses : NumResponses + 1 > .
+
+  --- 4. 충분한 수의 응답이 들어왔을 때
+  --- 4-1. 찬성 표가 정족수를 넘는다면 leader가 된다. 가지고 있는 값들을 초기화한다.
+  crl [candidate-become-leader] :
+    < Candidate : ONode | type : CandidateNode, nodeTerm : CurrentTerm, log : CurrentLog, neighbors : Followers, isWaiting : BoolValue, quorum : Quorum, numPros : NumPros, numNeighbors : NumNeighbors, numResponses : NumNeighbors >
+    =>
+    < Candidate : ONode | type : LeaderNode, isWaiting : true, numPros : 1, numResponses : 0  >
+    (multicast requestAppendEntry(CurrentTerm, CurrentLog) from Candidate to Followers)
+    if NumPros >= Quorum .
+
+  --- 4-2. 찬성 표가 정족수를 넘지 못한다면 follower가 된다.
+  crl [candidate-defeat-vote] :
+    < Candidate : ONode | type : CandidateNode, nodeTerm : CurrentTerm, quorum : Quorum, numPros : NumPros, numNeighbors : NumNeighbors, numResponses : NumNeighbors >
+    =>
+    < Candidate : ONode | type : FollowerNode >
+    if NumPros < Quorum .
+
+
+
+  --- kill action
+  --- leader가 죽는 경우
+  rl [leader-become-offline] :
+    < Leader : ONode | type : LeaderNode, nodeTerm : CurrentTerm >
+    =>
+    < Leader : ONode | type : OfflineNode > .
+
+  --- follower를 죽이는 경우
+  rl [follower-become-offline] :
+    < Follower : ONode | type : FollowerNode >
+    =>
+    < Follower : ONode | type : OfflineNode > .
+
+  --- candidate를 죽이는 경우
+  rl [die] :
+    < Leader : ONode | type : CandidateNode, nodeTerm : CurrentTerm >
+    =>
+    < Leader : ONode | type : OfflineNode > .
+
+
+
+  ------ offline action
+  --- offline으로 들어온 appendEntryRequest 무시
+  rl [offline-ignore-append-entry-request] :
+    (msg requestAppendEntry(CurrentTerm, CurrentLog) from Leader to Follower)
+    < Follower : ONode | type : OfflineNode >
+    =>
+    < Follower : ONode | >
+    (msg responseAppendEntry(CurrentTerm, false) from Follower to Leader) .
+
+  --- offline으로 들어온 appendEntryResponse 무시
+  rl [offine-ignore-append-entry-response] :
+    (msg responseAppendEntry(CurrentTerm, BoolValue) from Follower to Leader)
+    < Leader : ONode | type : OfflineNode >
+    =>
+    < Leader : ONode | > .
+
+  --- offline으로 들어온 commitRequest 무시
+  rl [offline-ignore-commit-request] :
+    (msg requestCommit(CurrentTerm, CurrentEntry) from Leader to Follower)
+    < Follower : ONode | type : OfflineNode >
+    =>
+    < Follower : ONode | > .
+
+  --- offline으로 들어온 voteRequest 무시
+  rl [offline-ignore-vote-request] :
+    (msg requestVote(CurrentTerm, CurrentEntry) from Leader to Follower)
+    < Follower : ONode | type : OfflineNode >
+    =>
+    < Follower : ONode | >
+    (msg responseVote(CurrentTerm, false) from Follower to Leader) .
+
+  --- offline으로 들어온 voteResponse 무시
+  rl [offline-ignore-vote-response] :
+    (msg responseVote(CurrentTerm, BoolValue) from Leader to Follower)
+    < Follower : ONode | type : OfflineNode >
+    =>
+    < Follower : ONode | > .
+
+  --- offline이 다시 online으로 변경
+  rl [come-online] :
+    < Follower : ONode | type : OfflineNode >
+    =>
+    < Follower : ONode | type : FollowerNode > .
+endom
+
+mod SIMUL is
+  pr ONODE .
+
+  op Client : -> Cid [ctor] .
+  op client : -> Oid [ctor] .
+
+  --- node 3개일 때 + leader 만들기
+  op test3Node :  -> Configuration .
+  eq test3Node =
+    (msg clientRequest("client-request") from client to onode(0))
+    (msg clientRequest("client-request2") from client to onode(0))
+    < client : Client | >
+    < onode(0) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(1), onode(2)),
+      isWaiting : false, quorum : 2, numNeighbors : 2, numPros : 1, numResponses : 0 >
+    < onode(1) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(2)),
+      isWaiting : false, quorum : 2, numNeighbors : 2, numPros : 1, numResponses : 0 >
+    < onode(2) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1)),
+      isWaiting : false,quorum : 2, numNeighbors : 2, numPros : 1, numResponses : 0 > .
+
+  --- node 3개일 때 + kill하기
+  op testKill :  -> Configuration .
+  eq testKill =
+  (msg clientRequest("client-request") from client to onode(0))
+  (msg clientRequest("client-request2") from client to onode(0))
+  < client : Client | >
+  < onode(0) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(1), onode(2)),
+      isWaiting : false, quorum : 2, numNeighbors : 2, numPros : 1, numResponses : 0 >
+  < onode(1) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(2)),
+      isWaiting : false, quorum : 2, numNeighbors : 2, numPros : 1, numResponses : 0 >
+  < onode(2) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1)),
+      isWaiting : false, quorum : 2, numNeighbors : 2, numPros : 1, numResponses : 0 > .
+
+  --- node 3개일 때 + offline을 online으로 만들기
+  op testRevive :  -> Configuration .
+  eq testRevive =
+    (msg clientRequest("client-request") from client to onode(0))
+    (msg clientRequest("client-request2") from client to onode(0))
+    < client : Client | >
+    < onode(0) : ONode | type : LeaderNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(1), onode(2)),
+        isWaiting : false, quorum : 2, numNeighbors : 2, numPros : 1, numResponses : 0 >
+    < onode(1) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(2)),
+        isWaiting : false, quorum : 2, numNeighbors : 2, numPros : 1, numResponses : 0 >
+    < onode(2) : ONode | type : OfflineNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1)),
+        isWaiting : false, quorum : 2, numNeighbors : 2, numPros : 1, numResponses : 0 > .
+
+  op test4NodeCompetition :  -> Configuration .
+  eq test4NodeCompetition =
+  < client : Client | >
+  < onode(0) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(1), onode(2), onode(3)),
+        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
+  < onode(1) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(2), onode(3)),
+        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
+  < onode(2) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(3)),
+        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
+  < onode(3) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(2)),
+        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 > .
+
+  op test4Node :  -> Configuration .
+  eq test4Node =
+  (msg clientRequest("client-request1") from client to onode(0))
+  (msg clientRequest("client-request2") from client to onode(0))
+  < client : Client | >
+  < onode(0) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(1), onode(2), onode(3)),
+        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
+  < onode(1) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(2), onode(3)),
+        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
+  < onode(2) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(3)),
+        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
+  < onode(3) : ONode | type : OfflineNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(2)),
+        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 > .
+
+  op test4NodeLeaderKillWithQuorum :  -> Configuration .
+  eq test4NodeLeaderKillWithQuorum =
+  (msg clientRequest("client-request1") from client to onode(1))
+  (msg clientRequest("client-request2") from client to onode(1))
+  < client : Client | >
+  < onode(0) : ONode | type : LeaderNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(1), onode(2), onode(3)),
+        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
+  < onode(1) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(2), onode(3)),
+        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
+  < onode(2) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(3)),
+        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
+  < onode(3) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(2)),
+        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 > .
+  --- leader 선출
+
+  op test4NodeLeaderKillWithoutQuorum :  -> Configuration .
+  eq test4NodeLeaderKillWithoutQuorum =
+  (msg clientRequest("client-request1") from client to onode(1))
+  (msg clientRequest("client-request2") from client to onode(1))
+  < client : Client | >
+  < onode(0) : ONode | type : LeaderNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(1), onode(2), onode(3)),
+        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
+  < onode(1) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(2), onode(3)),
+        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
+  < onode(2) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(3)),
+        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
+  < onode(3) : ONode | type : OfflineNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(2)),
+        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 > .
+  --- 계속 돔
+
+  op test5Node :  -> Configuration .
+  eq test5Node =
+  (msg clientRequest("client-request1") from client to onode(0))
+  (msg clientRequest("client-request2") from client to onode(0))
+  < client : Client | >
+  < onode(0) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(1), onode(2), onode(3), onode(4)),
+        isWaiting : false, quorum : 3, numNeighbors : 4, numPros : 1, numResponses : 0 >
+  < onode(1) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(2), onode(3), onode(4)),
+        isWaiting : false, quorum : 3, numNeighbors : 4, numPros : 1, numResponses : 0 >
+  < onode(2) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(3), onode(4)),
+        isWaiting : false, quorum : 3, numNeighbors : 4, numPros : 1, numResponses : 0 >
+  < onode(3) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(2), onode(4)),
+        isWaiting : false, quorum : 3, numNeighbors : 4, numPros : 1, numResponses : 0 >
+  < onode(4) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(2), onode(3)),
+        isWaiting : false, quorum : 3, numNeighbors : 4, numPros : 1, numResponses : 0 > .
+
+
+  op test6Node :  -> Configuration .
+  eq test6Node =
+  (msg clientRequest("client-request1") from client to onode(0))
+  (msg clientRequest("client-request2") from client to onode(0))
+  < client : Client | >
+  < onode(0) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(1), onode(2), onode(3), onode(4), onode(5)),
+        isWaiting : false, quorum : 4, numNeighbors : 5, numPros : 1, numResponses : 0 >
+  < onode(1) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(2), onode(3), onode(4), onode(5)),
+        isWaiting : false, quorum : 4, numNeighbors : 5, numPros : 1, numResponses : 0 >
+  < onode(2) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(3), onode(4), onode(5)),
+        isWaiting : false, quorum : 4, numNeighbors : 5, numPros : 1, numResponses : 0 >
+  < onode(3) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(2), onode(4), onode(5)),
+        isWaiting : false, quorum : 4, numNeighbors : 5, numPros : 1, numResponses : 0 >
+  < onode(4) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(2), onode(3), onode(5)),
+        isWaiting : false, quorum : 4, numNeighbors : 5, numPros : 1, numResponses : 0 >
+  < onode(5) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(2), onode(3), onode(4)),
+        isWaiting : false, quorum : 4, numNeighbors : 5, numPros : 1, numResponses : 0 > .
+  
+endm
+
+
+***(
+
+  set trace on .
+
+  rew [3] test3Node .
+
+  ------ 기본
+  --- 실행 확인
+  search [1] test3Node =>! C:Configuration .
+
+  --- 2개의 leader 존재 여부 확인 (leader safety)
+  search [1] test3Node =>* C:Configuration
+    < O1:Oid : ONode | type : LeaderNode >
+    < O2:Oid : ONode | type : LeaderNode > .
+
+  --- 같은 log일 때 다른 log 존재 여부 확인 (log matching)
+  search [1] test3Node =>* C:Configuration
+    < O1:Oid : ONode | log : L11:Log ++ entry(ind:Nat, term:Nat, C1:Command) ++ L12:Log >
+    < O2:Oid : ONode | log : L21:Log ++ entry(ind:Nat, term:Nat, C2:Command) ++ L22:Log >
+    such that C1:Command =/= C2:Command or L11:Log =/= L21:Log .
+
+  --- 같은 log일 때 다른 log 존재 여부 확인 (committed log matching)
+  search [1] test3Node =>* C:Configuration
+    < O1:Oid : ONode | committedLog : L11:Log ++ entry(ind:Nat, term:Nat, C1:Command) ++ L12:Log >
+    < O2:Oid : ONode | committedLog : L21:Log ++ entry(ind:Nat, term:Nat, C2:Command) ++ L22:Log >
+    such that C1:Command =/= C2:Command or L11:Log =/= L21:Log .
+
+
+
+  ------ kill 확인
+  --- 실행 확인
+  search [1] testKill =>! C:Configuration .
+
+  --- 2개의 leader 존재 여부 확인 (leader safety)
+  search [1] testKill =>* C:Configuration
+    < O1:Oid : ONode | type : LeaderNode >
+    < O2:Oid : ONode | type : LeaderNode > .
+
+  --- 같은 log일 때 다른 log 존재 여부 확인 (log matching)
+  search [1] testKill =>* C:Configuration
+    < O1:Oid : ONode | log : L11:Log ++ entry(ind:Nat, term:Nat, C1:Command) ++ L12:Log >
+    < O2:Oid : ONode | log : L21:Log ++ entry(ind:Nat, term:Nat, C2:Command) ++ L22:Log >
+    such that C1:Command =/= C2:Command or L11:Log =/= L21:Log .
+
+  --- 같은 log일 때 다른 log 존재 여부 확인 (committed log matching)
+  search [1] testKill =>* C:Configuration
+    < O1:Oid : ONode | committedLog : L11:Log ++ entry(ind:Nat, term:Nat, C1:Command) ++ L12:Log >
+    < O2:Oid : ONode | committedLog : L21:Log ++ entry(ind:Nat, term:Nat, C2:Command) ++ L22:Log >
+    such that C1:Command =/= C2:Command or L11:Log =/= L21:Log .
+
+
+
+  ------ revive 확인
+  --- 실행 확인
+  search [1] testRevive =>! C:Configuration .
+
+  --- 2개의 leader 존재 여부 확인 (leader safety)
+  search [1] testRevive =>* C:Configuration
+    < O1:Oid : ONode | type : LeaderNode >
+    < O2:Oid : ONode | type : LeaderNode > .
+
+  --- 같은 log일 때 다른 log 존재 여부 확인 (log matching)
+  search [1] testRevive =>* C:Configuration
+    < O1:Oid : ONode | log : L11:Log ++ entry(ind:Nat, term:Nat, C1:Command) ++ L12:Log >
+    < O2:Oid : ONode | log : L21:Log ++ entry(ind:Nat, term:Nat, C2:Command) ++ L22:Log >
+    such that C1:Command =/= C2:Command or L11:Log =/= L21:Log .
+
+  --- 같은 log일 때 다른 log 존재 여부 확인 (committed log matching)
+  search [1] testRevive =>* C:Configuration
+    < O1:Oid : ONode | committedLog : L11:Log ++ entry(ind:Nat, term:Nat, C1:Command) ++ L12:Log >
+    < O2:Oid : ONode | committedLog : L21:Log ++ entry(ind:Nat, term:Nat, C2:Command) ++ L22:Log >
+    such that C1:Command =/= C2:Command or L11:Log =/= L21:Log .
+
+
+
+  ------ node 4개일 때
+  search [1] test4Node =>! C:Configuration .
+
+  --- 선거 경쟁
+  search [1] test4NodeCompetition =>! C:Configuration .
+
+  search [1] test4NodeCompetition =>* C:Configuration
+    < O1:Oid : ONode | type : LeaderNode >
+    < O2:Oid : ONode | type : LeaderNode > .
+
+  search [1] test4NodeCompetition =>* C:Configuration
+    < O1:Oid : ONode | type : LeaderNode > .
+
+  search [1] test4NodeCompetition =>* C:Configuration
+    < onode(0) : ONode | type : LeaderNode > .
+
+  search [1] test4NodeCompetition =>* C:Configuration
+    < onode(1) : ONode | type : LeaderNode > .
+
+  ------ node 4개일 때 leader kill : 정족수 만족/불만족
+  search [1] test4NodeLeaderKillWithQuorum =>! C:Configuration .
+  search [1] test4NodeLeaderKillWithoutQuorum =>! C:Configuration .
+
+
+
+  ------ node 5개일 때 (약 20-30초)
+  search [1] test5Node =>! C:Configuration .
+
+  ------ node 6개일 때 (약 15분)
+  search [1] test6Node =>! C:Configuration .
+
+
+  1. omod로 변환하기 (사용되지 않는 것들을 지울 수 있다.)
+      - class는 바꾸면 안되고, 어떤 node인지 type으로 두면 될 듯.
+      - OK
+  2. 현재 추상화 레벨에서 confluent하게 모델링했다는 내용 (kill, timeout, 등등)
+      - token ring 없애고 rl 사용해서 모든 rule을 nondeterministic하게 바꾸기
+      - 없앤 버전과, 원래 버전의 차이점을 명시하고, 어떤 것을 해결하기 위해 이렇게 변경했는지
+
+
+  - confluent한 모델 (모든 게 nondeterministic한 버전)
+  - 기존 버전과 차이점
+  - 어떤 것을 해결하기 위해 이렇게 변경했는지
+  - 그 결과는 어떠한지
+
+  문제 생기면 교수님께 따로 연락 드리기 / 잘 해결하면 했다고 연락 드리기
+)
