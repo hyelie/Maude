@@ -284,7 +284,7 @@ omod ONODE is
 
   --- candidate를 죽이는 경우
   rl [die] :
-    < CurrentNode : ONode | type : CandidateNode, nodeTerm : CurrentTerm >
+    < CurrentNode : ONode | type : CandidateNode >
     =>
     < CurrentNode : ONode | type : OfflineNode > .
 
@@ -293,37 +293,37 @@ omod ONODE is
   ------ offline action
   --- offline으로 들어온 appendEntryRequest 무시
   rl [offline-ignore-append-entry-request] :
-    (msg requestAppendEntry(CurrentTerm, CurrentLog) from Leader to Follower)
+    (msg requestAppendEntry(CurrentTerm, CurrentLog) from Leader to CurrentNode)
     < CurrentNode : ONode | type : OfflineNode >
     =>
     < CurrentNode : ONode | >
-    (msg responseAppendEntry(CurrentTerm, false) from Follower to Leader) .
+    (msg responseAppendEntry(CurrentTerm, false) from CurrentNode to Leader) .
 
   --- offline으로 들어온 appendEntryResponse 무시
   rl [offine-ignore-append-entry-response] :
-    (msg responseAppendEntry(CurrentTerm, BoolValue) from Follower to Leader)
+    (msg responseAppendEntry(CurrentTerm, BoolValue) from Follower to CurrentNode)
     < CurrentNode : ONode | type : OfflineNode >
     =>
     < CurrentNode : ONode | > .
 
   --- offline으로 들어온 commitRequest 무시
   rl [offline-ignore-commit-request] :
-    (msg requestCommit(CurrentTerm, CurrentEntry) from Leader to Follower)
+    (msg requestCommit(CurrentTerm, CurrentEntry) from Leader to CurrentNode)
     < CurrentNode : ONode | type : OfflineNode >
     =>
     < CurrentNode : ONode | > .
 
   --- offline으로 들어온 voteRequest 무시
   rl [offline-ignore-vote-request] :
-    (msg requestVote(CurrentTerm, CurrentEntry) from Leader to Follower)
+    (msg requestVote(CurrentTerm, CurrentEntry) from Leader to CurrentNode)
     < CurrentNode : ONode | type : OfflineNode >
     =>
     < CurrentNode : ONode | >
-    (msg responseVote(CurrentTerm, false) from Follower to Leader) .
+    (msg responseVote(CurrentTerm, false) from CurrentNode to Leader) .
 
   --- offline으로 들어온 voteResponse 무시
   rl [offline-ignore-vote-response] :
-    (msg responseVote(CurrentTerm, BoolValue) from Leader to Follower)
+    (msg responseVote(CurrentTerm, BoolValue) from Leader to CurrentNode)
     < CurrentNode : ONode | type : OfflineNode >
     =>
     < CurrentNode : ONode | > .
@@ -401,47 +401,27 @@ endm
   10: states: 142304  rewrites: 1244049 in 25047ms cpu (25330ms real) (49667 rewrites/second)
   11: states: 345930  rewrites: 3046704 in 86698ms cpu (87949ms real) (35141 rewrites/second)
 
+  --- leader가 존재하는지 확인
+    search [1] test3Node =>* C:Configuration
+    < O1:Oid : ONode | type : LeaderNode, AS1:AttributeSet > .
+
   --- 2개의 leader 존재 여부 확인 (leader safety)
-  search [1] test3Node =>* C:Configuration
-    < O1:Oid : ONode | type : LeaderNode >
-    < O2:Oid : ONode | type : LeaderNode > .
+  search [1, 10] test3Node =>* C:Configuration
+    < O1:Oid : ONode | type : LeaderNode, AS1:AttributeSet >
+    < O2:Oid : ONode | type : LeaderNode, AS2:AttributeSet > .
 
   --- 같은 log일 때 다른 log 존재 여부 확인 (log matching)
-  search [1] test3Node =>* C:Configuration
-    < O1:Oid : ONode | log : L11:Log ++ entry(ind:Nat, term:Nat, C1:Command) ++ L12:Log >
-    < O2:Oid : ONode | log : L21:Log ++ entry(ind:Nat, term:Nat, C2:Command) ++ L22:Log >
+  search [1, 10] test3Node =>* C:Configuration
+    < O1:Oid : ONode | log : L11:Log ++ entry(ind:Nat, term:Nat, C1:Command) ++ L12:Log, AS1:AttributeSet >
+    < O2:Oid : ONode | log : L21:Log ++ entry(ind:Nat, term:Nat, C2:Command) ++ L22:Log, AS2:AttributeSet >
     such that C1:Command =/= C2:Command or L11:Log =/= L21:Log .
 
   --- 같은 log일 때 다른 log 존재 여부 확인 (committed log matching)
-  search [1] test3Node =>* C:Configuration
-    < O1:Oid : ONode | committedLog : L11:Log ++ entry(ind:Nat, term:Nat, C1:Command) ++ L12:Log >
-    < O2:Oid : ONode | committedLog : L21:Log ++ entry(ind:Nat, term:Nat, C2:Command) ++ L22:Log >
+  search [1, 10] test3Node =>* C:Configuration
+    < O1:Oid : ONode | committedLog : L11:Log ++ entry(ind:Nat, term:Nat, C1:Command) ++ L12:Log, AS1:AttributeSet >
+    < O2:Oid : ONode | committedLog : L21:Log ++ entry(ind:Nat, term:Nat, C2:Command) ++ L22:Log, AS2:AttributeSet >
     such that C1:Command =/= C2:Command or L11:Log =/= L21:Log .
 
-
-
-  ------ node 4개일 때
-  search [1] test4Node =>! C:Configuration .
-
-  --- 선거 경쟁
-  search [1] test4NodeCompetition =>! C:Configuration .
-
-  search [1] test4NodeCompetition =>* C:Configuration
-    < O1:Oid : ONode | type : LeaderNode >
-    < O2:Oid : ONode | type : LeaderNode > .
-
-  search [1] test4NodeCompetition =>* C:Configuration
-    < O1:Oid : ONode | type : LeaderNode > .
-
-  search [1] test4NodeCompetition =>* C:Configuration
-    < onode(0) : ONode | type : LeaderNode > .
-
-  search [1] test4NodeCompetition =>* C:Configuration
-    < onode(1) : ONode | type : LeaderNode > .
-
-  ------ node 4개일 때 leader kill : 정족수 만족/불만족
-  search [1] test4NodeLeaderKillWithQuorum =>! C:Configuration .
-  search [1] test4NodeLeaderKillWithoutQuorum =>! C:Configuration .
 
 
 
