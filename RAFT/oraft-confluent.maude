@@ -53,8 +53,7 @@ fmod LOG is
   --- check Log contains entry
   op contains : Log Entry -> Bool .
   eq contains(Arr1 ++ E ++ Arr2, E) = true .
-  eq contains(Arr1, E) = false . --- owise
-  --- 임의의 순서로 실행될 수 있어서 owise가 추가되어야 한다.  TODO confluent (어떤 순서로 실행해도 결과 동일)
+  eq contains(Arr1, E) = false [owise] .
 
   --- get top of Log
   op head : Log -> Entry .
@@ -146,7 +145,7 @@ omod ONODE is
 
   --- transition을 위한 변수들
   var command : Command .
-  vars Client Leader Follower Candidate CurrentNode NextNode : Oid .
+  vars Client Leader Follower Candidate Offline CurrentNode NextNode : Oid .
   var Followers : OidSet .
   vars CurrentLog NextLog CommittedLog : Log .
   var CommitEntry CurrentEntry LeaderEntry FollowerEntry VoteEntry : Entry .
@@ -273,21 +272,21 @@ omod ONODE is
   --- kill action
   --- leader가 죽는 경우
   rl [leader-become-offline] :
-    < Leader : ONode | type : LeaderNode, nodeTerm : CurrentTerm >
+    < CurrentNode : ONode | type : LeaderNode >
     =>
-    < Leader : ONode | type : OfflineNode > .
+    < CurrentNode : ONode | type : OfflineNode > .
 
   --- follower를 죽이는 경우
   rl [follower-become-offline] :
-    < Follower : ONode | type : FollowerNode >
+    < CurrentNode : ONode | type : FollowerNode >
     =>
-    < Follower : ONode | type : OfflineNode > .
+    < CurrentNode : ONode | type : OfflineNode > .
 
   --- candidate를 죽이는 경우
   rl [die] :
-    < Leader : ONode | type : CandidateNode, nodeTerm : CurrentTerm >
+    < CurrentNode : ONode | type : CandidateNode, nodeTerm : CurrentTerm >
     =>
-    < Leader : ONode | type : OfflineNode > .
+    < CurrentNode : ONode | type : OfflineNode > .
 
 
 
@@ -295,45 +294,45 @@ omod ONODE is
   --- offline으로 들어온 appendEntryRequest 무시
   rl [offline-ignore-append-entry-request] :
     (msg requestAppendEntry(CurrentTerm, CurrentLog) from Leader to Follower)
-    < Follower : ONode | type : OfflineNode >
+    < CurrentNode : ONode | type : OfflineNode >
     =>
-    < Follower : ONode | >
+    < CurrentNode : ONode | >
     (msg responseAppendEntry(CurrentTerm, false) from Follower to Leader) .
 
   --- offline으로 들어온 appendEntryResponse 무시
   rl [offine-ignore-append-entry-response] :
     (msg responseAppendEntry(CurrentTerm, BoolValue) from Follower to Leader)
-    < Leader : ONode | type : OfflineNode >
+    < CurrentNode : ONode | type : OfflineNode >
     =>
-    < Leader : ONode | > .
+    < CurrentNode : ONode | > .
 
   --- offline으로 들어온 commitRequest 무시
   rl [offline-ignore-commit-request] :
     (msg requestCommit(CurrentTerm, CurrentEntry) from Leader to Follower)
-    < Follower : ONode | type : OfflineNode >
+    < CurrentNode : ONode | type : OfflineNode >
     =>
-    < Follower : ONode | > .
+    < CurrentNode : ONode | > .
 
   --- offline으로 들어온 voteRequest 무시
   rl [offline-ignore-vote-request] :
     (msg requestVote(CurrentTerm, CurrentEntry) from Leader to Follower)
-    < Follower : ONode | type : OfflineNode >
+    < CurrentNode : ONode | type : OfflineNode >
     =>
-    < Follower : ONode | >
+    < CurrentNode : ONode | >
     (msg responseVote(CurrentTerm, false) from Follower to Leader) .
 
   --- offline으로 들어온 voteResponse 무시
   rl [offline-ignore-vote-response] :
     (msg responseVote(CurrentTerm, BoolValue) from Leader to Follower)
-    < Follower : ONode | type : OfflineNode >
+    < CurrentNode : ONode | type : OfflineNode >
     =>
-    < Follower : ONode | > .
+    < CurrentNode : ONode | > .
 
   --- offline이 다시 online으로 변경
   rl [come-online] :
-    < Follower : ONode | type : OfflineNode >
+    < CurrentNode : ONode | type : OfflineNode >
     =>
-    < Follower : ONode | type : FollowerNode > .
+    < CurrentNode : ONode | type : FollowerNode > .
 endom
 
 mod SIMUL is
@@ -355,38 +354,12 @@ mod SIMUL is
     < onode(2) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1)),
       isWaiting : false,quorum : 2, numNeighbors : 2, numPros : 1, numResponses : 0 > .
 
-  --- node 3개일 때 + kill하기
-  op testKill :  -> Configuration .
-  eq testKill =
-  (msg clientRequest("client-request") from client to onode(0))
-  (msg clientRequest("client-request2") from client to onode(0))
-  < client : Client | >
-  < onode(0) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(1), onode(2)),
-      isWaiting : false, quorum : 2, numNeighbors : 2, numPros : 1, numResponses : 0 >
-  < onode(1) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(2)),
-      isWaiting : false, quorum : 2, numNeighbors : 2, numPros : 1, numResponses : 0 >
-  < onode(2) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1)),
-      isWaiting : false, quorum : 2, numNeighbors : 2, numPros : 1, numResponses : 0 > .
-
-  --- node 3개일 때 + offline을 online으로 만들기
-  op testRevive :  -> Configuration .
-  eq testRevive =
-    (msg clientRequest("client-request") from client to onode(0))
-    (msg clientRequest("client-request2") from client to onode(0))
-    < client : Client | >
-    < onode(0) : ONode | type : LeaderNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(1), onode(2)),
-        isWaiting : false, quorum : 2, numNeighbors : 2, numPros : 1, numResponses : 0 >
-    < onode(1) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(2)),
-        isWaiting : false, quorum : 2, numNeighbors : 2, numPros : 1, numResponses : 0 >
-    < onode(2) : ONode | type : OfflineNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1)),
-        isWaiting : false, quorum : 2, numNeighbors : 2, numPros : 1, numResponses : 0 > .
-
   op test4NodeCompetition :  -> Configuration .
   eq test4NodeCompetition =
   < client : Client | >
-  < onode(0) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(1), onode(2), onode(3)),
+  < onode(0) : ONode | type : CandidateNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(1), onode(2), onode(3)),
         isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
-  < onode(1) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(2), onode(3)),
+  < onode(1) : ONode | type : CandidateNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(2), onode(3)),
         isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
   < onode(2) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(3)),
         isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
@@ -406,72 +379,6 @@ mod SIMUL is
         isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
   < onode(3) : ONode | type : OfflineNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(2)),
         isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 > .
-
-  op test4NodeLeaderKillWithQuorum :  -> Configuration .
-  eq test4NodeLeaderKillWithQuorum =
-  (msg clientRequest("client-request1") from client to onode(1))
-  (msg clientRequest("client-request2") from client to onode(1))
-  < client : Client | >
-  < onode(0) : ONode | type : LeaderNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(1), onode(2), onode(3)),
-        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
-  < onode(1) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(2), onode(3)),
-        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
-  < onode(2) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(3)),
-        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
-  < onode(3) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(2)),
-        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 > .
-  --- leader 선출
-
-  op test4NodeLeaderKillWithoutQuorum :  -> Configuration .
-  eq test4NodeLeaderKillWithoutQuorum =
-  (msg clientRequest("client-request1") from client to onode(1))
-  (msg clientRequest("client-request2") from client to onode(1))
-  < client : Client | >
-  < onode(0) : ONode | type : LeaderNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(1), onode(2), onode(3)),
-        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
-  < onode(1) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(2), onode(3)),
-        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
-  < onode(2) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(3)),
-        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 >
-  < onode(3) : ONode | type : OfflineNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(2)),
-        isWaiting : false, quorum : 3, numNeighbors : 3, numPros : 1, numResponses : 0 > .
-  --- 계속 돔
-
-  op test5Node :  -> Configuration .
-  eq test5Node =
-  (msg clientRequest("client-request1") from client to onode(0))
-  (msg clientRequest("client-request2") from client to onode(0))
-  < client : Client | >
-  < onode(0) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(1), onode(2), onode(3), onode(4)),
-        isWaiting : false, quorum : 3, numNeighbors : 4, numPros : 1, numResponses : 0 >
-  < onode(1) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(2), onode(3), onode(4)),
-        isWaiting : false, quorum : 3, numNeighbors : 4, numPros : 1, numResponses : 0 >
-  < onode(2) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(3), onode(4)),
-        isWaiting : false, quorum : 3, numNeighbors : 4, numPros : 1, numResponses : 0 >
-  < onode(3) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(2), onode(4)),
-        isWaiting : false, quorum : 3, numNeighbors : 4, numPros : 1, numResponses : 0 >
-  < onode(4) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(2), onode(3)),
-        isWaiting : false, quorum : 3, numNeighbors : 4, numPros : 1, numResponses : 0 > .
-
-
-  op test6Node :  -> Configuration .
-  eq test6Node =
-  (msg clientRequest("client-request1") from client to onode(0))
-  (msg clientRequest("client-request2") from client to onode(0))
-  < client : Client | >
-  < onode(0) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(1), onode(2), onode(3), onode(4), onode(5)),
-        isWaiting : false, quorum : 4, numNeighbors : 5, numPros : 1, numResponses : 0 >
-  < onode(1) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(2), onode(3), onode(4), onode(5)),
-        isWaiting : false, quorum : 4, numNeighbors : 5, numPros : 1, numResponses : 0 >
-  < onode(2) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(3), onode(4), onode(5)),
-        isWaiting : false, quorum : 4, numNeighbors : 5, numPros : 1, numResponses : 0 >
-  < onode(3) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(2), onode(4), onode(5)),
-        isWaiting : false, quorum : 4, numNeighbors : 5, numPros : 1, numResponses : 0 >
-  < onode(4) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(2), onode(3), onode(5)),
-        isWaiting : false, quorum : 4, numNeighbors : 5, numPros : 1, numResponses : 0 >
-  < onode(5) : ONode | type : FollowerNode, nodeTerm : 0, log : entry(0, 0, "startup"), committedLog : entry(0, 0, "startup"), neighbors : (onode(0), onode(1), onode(2), onode(3), onode(4)),
-        isWaiting : false, quorum : 4, numNeighbors : 5, numPros : 1, numResponses : 0 > .
-  
 endm
 
 
@@ -485,6 +392,15 @@ endm
   --- 실행 확인
   search [1] test3Node =>! C:Configuration .
 
+  5에서 11 depth
+  5: states: 1326  rewrites: 11971 in 28ms cpu (26ms real) (427535 rewrites/second)
+  6: states: 3529  rewrites: 31278 in 63ms cpu (63ms real) (489590 rewrites/second)
+  7: states: 9153  rewrites: 80878 in 211ms cpu (236ms real) (381535 rewrites/second)
+  8: states: 23228  rewrites: 204540 in 5478ms cpu (5582ms real) (37332 rewrites/second)
+  9: states: 57904  rewrites: 506788 in 9233ms cpu (9370ms real) (54883 rewrites/second)
+  10: states: 142304  rewrites: 1244049 in 25047ms cpu (25330ms real) (49667 rewrites/second)
+  11: states: 345930  rewrites: 3046704 in 86698ms cpu (87949ms real) (35141 rewrites/second)
+
   --- 2개의 leader 존재 여부 확인 (leader safety)
   search [1] test3Node =>* C:Configuration
     < O1:Oid : ONode | type : LeaderNode >
@@ -498,52 +414,6 @@ endm
 
   --- 같은 log일 때 다른 log 존재 여부 확인 (committed log matching)
   search [1] test3Node =>* C:Configuration
-    < O1:Oid : ONode | committedLog : L11:Log ++ entry(ind:Nat, term:Nat, C1:Command) ++ L12:Log >
-    < O2:Oid : ONode | committedLog : L21:Log ++ entry(ind:Nat, term:Nat, C2:Command) ++ L22:Log >
-    such that C1:Command =/= C2:Command or L11:Log =/= L21:Log .
-
-
-
-  ------ kill 확인
-  --- 실행 확인
-  search [1] testKill =>! C:Configuration .
-
-  --- 2개의 leader 존재 여부 확인 (leader safety)
-  search [1] testKill =>* C:Configuration
-    < O1:Oid : ONode | type : LeaderNode >
-    < O2:Oid : ONode | type : LeaderNode > .
-
-  --- 같은 log일 때 다른 log 존재 여부 확인 (log matching)
-  search [1] testKill =>* C:Configuration
-    < O1:Oid : ONode | log : L11:Log ++ entry(ind:Nat, term:Nat, C1:Command) ++ L12:Log >
-    < O2:Oid : ONode | log : L21:Log ++ entry(ind:Nat, term:Nat, C2:Command) ++ L22:Log >
-    such that C1:Command =/= C2:Command or L11:Log =/= L21:Log .
-
-  --- 같은 log일 때 다른 log 존재 여부 확인 (committed log matching)
-  search [1] testKill =>* C:Configuration
-    < O1:Oid : ONode | committedLog : L11:Log ++ entry(ind:Nat, term:Nat, C1:Command) ++ L12:Log >
-    < O2:Oid : ONode | committedLog : L21:Log ++ entry(ind:Nat, term:Nat, C2:Command) ++ L22:Log >
-    such that C1:Command =/= C2:Command or L11:Log =/= L21:Log .
-
-
-
-  ------ revive 확인
-  --- 실행 확인
-  search [1] testRevive =>! C:Configuration .
-
-  --- 2개의 leader 존재 여부 확인 (leader safety)
-  search [1] testRevive =>* C:Configuration
-    < O1:Oid : ONode | type : LeaderNode >
-    < O2:Oid : ONode | type : LeaderNode > .
-
-  --- 같은 log일 때 다른 log 존재 여부 확인 (log matching)
-  search [1] testRevive =>* C:Configuration
-    < O1:Oid : ONode | log : L11:Log ++ entry(ind:Nat, term:Nat, C1:Command) ++ L12:Log >
-    < O2:Oid : ONode | log : L21:Log ++ entry(ind:Nat, term:Nat, C2:Command) ++ L22:Log >
-    such that C1:Command =/= C2:Command or L11:Log =/= L21:Log .
-
-  --- 같은 log일 때 다른 log 존재 여부 확인 (committed log matching)
-  search [1] testRevive =>* C:Configuration
     < O1:Oid : ONode | committedLog : L11:Log ++ entry(ind:Nat, term:Nat, C1:Command) ++ L12:Log >
     < O2:Oid : ONode | committedLog : L21:Log ++ entry(ind:Nat, term:Nat, C2:Command) ++ L22:Log >
     such that C1:Command =/= C2:Command or L11:Log =/= L21:Log .
@@ -575,16 +445,9 @@ endm
 
 
 
-  ------ node 5개일 때 (약 20-30초)
-  search [1] test5Node =>! C:Configuration .
-
-  ------ node 6개일 때 (약 15분)
-  search [1] test6Node =>! C:Configuration .
-
-
+  show desugared ONODE .
   1. omod로 변환하기 (사용되지 않는 것들을 지울 수 있다.)
       - class는 바꾸면 안되고, 어떤 node인지 type으로 두면 될 듯.
-      - OK
   2. 현재 추상화 레벨에서 confluent하게 모델링했다는 내용 (kill, timeout, 등등)
       - token ring 없애고 rl 사용해서 모든 rule을 nondeterministic하게 바꾸기
       - 없앤 버전과, 원래 버전의 차이점을 명시하고, 어떤 것을 해결하기 위해 이렇게 변경했는지
@@ -596,4 +459,74 @@ endm
   - 그 결과는 어떠한지
 
   문제 생기면 교수님께 따로 연락 드리기 / 잘 해결하면 했다고 연락 드리기
+
+
+  기존 코드, raft-token-ring은 데모 때 보여드린 코드입니다.
+  oraft-confluent는 교수님의 피드백을 수정한 코드입니다. 변경사항은 다음과 같습니다.
+
+  1. omod로 변경
+  기존 module로 정의한 것을 omod로 변경했습니다. 이에 따라 rewriting logic에서 필요 없어진 attribute들을 삭제했습니다.
+```
+      class ONode | type : NodeType, nodeTerm : Nat, log : Log, committedLog : Log,
+                neighbors : OidSet, isWaiting : Bool,
+                quorum : Nat, numNeighbors : Nat, numPros : Nat,
+                numResponses : Nat .
+```
+    - 이에 따라 교수님이 언급해 주신 것처럼 class가 바뀌는 것이 아니라, class 내부에 지정한 type이 변경되게 변경했습니다. 예시는 다음과 같습니다.
+```
+    crl [candidate-defeat-vote] :
+    < Candidate : ONode | type : CandidateNode, nodeTerm : CurrentTerm, quorum : Quorum, numPros : NumPros, numNeighbors : NumNeighbors, numResponses : NumNeighbors >
+    =>
+    < Candidate : ONode | type : FollowerNode >
+    if NumPros < Quorum .
+```
+
+  2. convention
+  교수님께서 언급해 주신 convention에 따라 var로 선언된 것들을 대문자로 시작하게 변경했습니다.
+
+  3. confluent하게 변경했습니다.
+  기존에 제가 제시했던 코드는 제가 직접 kill, revive, timeout을 지정하는 방식이었습니다.
+  교수님이 피드백해주신 내용대로 해당 부분을 삭제하고, 각 node가 nondeterministic하게 죽는 rewriting logic을 추가했습니다.
+  또한 log contains에 owise도 추가했습니다.
+
+```
+  --- leader가 죽는 경우
+  rl [leader-become-offline] :
+    < CurrentNode : ONode | type : LeaderNode >
+    =>
+    < CurrentNode : ONode | type : OfflineNode > .
+
+  --- follower를 죽이는 경우
+  rl [follower-become-offline] :
+    < CurrentNode : ONode | type : FollowerNode >
+    =>
+    < CurrentNode : ONode | type : OfflineNode > .
+
+  --- candidate를 죽이는 경우
+  rl [die] :
+    < CurrentNode : ONode | type : CandidateNode, nodeTerm : CurrentTerm >
+    =>
+    < CurrentNode : ONode | type : OfflineNode > .
+
+  --- offline이 다시 online으로 변경
+  rl [come-online] :
+    < CurrentNode : ONode | type : OfflineNode >
+    =>
+    < CurrentNode : ONode | type : FollowerNode > .
+```
+
+그렇게 실행한 결과, test3Node search 명령어에 대해 depth를 지정했을 때 state 개수는 다음과 같습니다.
+교수님이 말씀해 주신 대로, nondeterministic하게 설정하면 state의 개수가 급격하게 증가하는 것을 확인할 수 있었습니다.
+```
+  search [1] test3Node =>! C:Configuration .
+
+  depth 5: states: 1326  rewrites: 11971 in 28ms cpu (26ms real) (427535 rewrites/second)
+  depth 6: states: 3529  rewrites: 31278 in 63ms cpu (63ms real) (489590 rewrites/second)
+  depth 7: states: 9153  rewrites: 80878 in 211ms cpu (236ms real) (381535 rewrites/second)
+  depth 8: states: 23228  rewrites: 204540 in 5478ms cpu (5582ms real) (37332 rewrites/second)
+  depth 9: states: 57904  rewrites: 506788 in 9233ms cpu (9370ms real) (54883 rewrites/second)
+  depth 10: states: 142304  rewrites: 1244049 in 25047ms cpu (25330ms real) (49667 rewrites/second)
+  depth 11: states: 345930  rewrites: 3046704 in 86698ms cpu (87949ms real) (35141 rewrites/second)
+```
+
 )
